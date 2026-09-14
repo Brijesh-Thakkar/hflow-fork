@@ -57,6 +57,27 @@ Guide: [Run HFlow inside a worker](../docs/how-to/run-embedded-workers.md)
 
 Code: [`embedded_worker.py`](./embedded_worker.py)
 
+## Continuous camera motion
+
+**Use it for:** streaming per-frame-pair motion and optional continuous shake
+measurements, including explicit tracking failures and unavailable filter context.
+
+**Prerequisites:** the root development environment (including OpenCV), a local
+fixed-frame-rate video, and its actual frame rate. HFlow may download its managed
+FFmpeg build. No model service or credentials are used.
+
+```bash
+uv run python examples/camera_motion.py recording.mp4 --fps 30 --shake
+```
+
+The example prints JSON Lines while decoding and measuring. It reads the video
+without modifying it and retains bounded decoder/filter state. Omit `--shake`
+for raw translation, rotation, scale, and fit evidence without filter lookahead.
+
+Guide: [Stream camera motion](../docs/how-to/stream-camera-motion.md)
+
+Code: [`camera_motion.py`](./camera_motion.py)
+
 ## Weighted measurement distributions
 
 **Use it for:** comparing measurement spread with an explicit observation

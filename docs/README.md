@@ -57,6 +57,7 @@ Use these when you already know the outcome you need.
 - [Port existing processing and quality-check code](./PORTING.md)
 - [Run embedded workers and import video](./how-to/run-embedded-workers.md)
 - [Summarize weighted measurements](./how-to/summarize-measurements.md)
+- [Stream continuous camera motion](./how-to/stream-camera-motion.md)
 - [Serve a workspace over HTTP](./SERVE.md)
 - [Call an OpenAI vision endpoint from a step](./how-to/call-openai-vision.md)
 - [Compare vision models on the Build AI evaluations](./how-to/run-build-ai-evaluation.md)

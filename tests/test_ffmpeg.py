@@ -655,6 +655,58 @@ def test_luma_frames_reaps_ffmpeg_when_the_caller_stops_early(
     assert first_frame.shape == (120, 160)
 
 
+def test_display_rotation_preserves_coded_frame_geometry_and_pixels(
+    black_tail_video: Path, tmp_path: Path
+) -> None:
+    rotated_video = tmp_path / "rotation-metadata.mp4"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-display_rotation",
+            "90",
+            "-i",
+            str(black_tail_video),
+            "-c",
+            "copy",
+            str(rotated_video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    rotation_probe = subprocess.run(
+        [
+            str(ffprobe_path()),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_side_data=rotation",
+            "-of",
+            "default=nw=1:nk=1",
+            str(rotated_video),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert abs(int(rotation_probe.stdout.strip())) == 90
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
+        luma_frames(rotated_video, toolchain=toolchain) as rotated_frames,
+    ):
+        frame_count = 0
+        for source_frame, rotated_frame in zip(source_frames, rotated_frames, strict=True):
+            assert source_frame.shape == rotated_frame.shape == (120, 160)
+            np.testing.assert_array_equal(source_frame, rotated_frame)
+            frame_count += 1
+    assert frame_count == 60
+
+
 def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
     not_a_video = tmp_path / "garbage.mp4"
     not_a_video.write_bytes(b"\x00\x01\x02not a video")
@@ -663,6 +715,49 @@ def test_luma_frames_on_a_non_video_raises(tmp_path: Path) -> None:
         luma_frames(not_a_video, toolchain=resolved_video_measurement_toolchain()) as frames,
     ):
         list(frames)
+
+
+def test_frame_decoder_selects_the_same_video_stream_as_dimension_probing(
+    black_tail_video: Path, tmp_path: Path
+) -> None:
+    multi_stream_video = tmp_path / "two-video-streams.mkv"
+    subprocess.run(
+        [
+            str(ffmpeg_path()),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(black_tail_video),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=white:size=320x240:rate=10:duration=6",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-c:v:0",
+            "copy",
+            "-c:v:1",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            str(multi_stream_video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    toolchain = resolved_video_measurement_toolchain()
+    with (
+        luma_frames(black_tail_video, toolchain=toolchain) as source_frames,
+        luma_frames(multi_stream_video, toolchain=toolchain) as decoded_frames,
+    ):
+        frame_count = 0
+        for source_frame, decoded_frame in zip(source_frames, decoded_frames, strict=True):
+            np.testing.assert_array_equal(source_frame, decoded_frame)
+            frame_count += 1
+    assert frame_count == 60
 
 
 def test_rgb_frames_streams_three_channels_at_the_coded_size(black_tail_video: Path) -> None:
