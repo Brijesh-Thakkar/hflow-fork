@@ -274,4 +274,4 @@ The existing `hflow.checks.camera_stability` aggregate retains its v1 policy.
 This stream preserves finite estimates and uses a 31-pair gap-aware filter.
 The check keeps its legacy 12-track policy, 30-pair filter at 30 fps, and
 zero-filled gaps. The stream's numerical values are not interchangeable with the legacy
-aggregate. No default quality gate or HUD task is enabled by using this API.
+aggregate. No default quality gate or scheduled task is enabled by using this API.

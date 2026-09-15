@@ -329,9 +329,47 @@ def test_window_preparation_preserves_requested_sampling_and_first_video_stream(
     assert prepared.properties.height == 90
     assert prepared.properties.duration_seconds == 1
     assert prepared.properties.frames_per_second == 4
+    assert prepared.source_window == VideoWindow(0.5, 1.0, 4.0)
     with pytest.raises(FileExistsError):
         prepare_video_window(multiple_streams, output, VideoWindow(0.5, 1, 4))
     assert not tuple(tmp_path.glob(".video-window-*"))
+
+
+def test_prepared_window_preserves_source_duration_despite_frame_padding(
+    source_video: Path, tmp_path: Path
+) -> None:
+    from hflow.media import PreparedVideoWindow, VideoWindow, prepare_video_window
+
+    window = VideoWindow(0, 0.65, 4)
+    prepared = prepare_video_window(source_video, tmp_path / "fractional.mp4", window)
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.source_window == window
+    assert float(prepared.properties.duration_seconds) > window.duration_seconds
+
+
+@pytest.mark.parametrize(
+    ("start_seconds", "requested_seconds", "covered_seconds"),
+    [(1.5, 1, 0.5), (1.75, 10, 0.25)],
+)
+def test_prepared_source_interval_stops_at_eof(
+    source_video: Path,
+    tmp_path: Path,
+    start_seconds: float,
+    requested_seconds: float,
+    covered_seconds: float,
+) -> None:
+    from hflow.media import PreparedVideoWindow, UnreadableVideo, VideoWindow, prepare_video_window
+
+    prepared = prepare_video_window(
+        source_video, tmp_path / "last-window.mp4", VideoWindow(start_seconds, requested_seconds, 4)
+    )
+    assert isinstance(prepared, PreparedVideoWindow)
+    assert prepared.source_window == VideoWindow(start_seconds, covered_seconds, 4)
+    beyond_source = tmp_path / "beyond-source.mp4"
+    assert isinstance(
+        prepare_video_window(source_video, beyond_source, VideoWindow(2, 1, 4)), UnreadableVideo
+    )
+    assert not beyond_source.exists()
 
 
 def test_tagged_video_duration_is_shared_by_probe_and_import(
