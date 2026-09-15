@@ -45,7 +45,13 @@ from hflow._video_measurements._raw_frames import (
     rgb_frames,
 )
 from hflow.episode import ExtractedFrame
-from hflow.ffmpeg import _binary, _contact_sheet
+from hflow.ffmpeg import (
+    PINNED_LINUX_X86_64_FFMPEG,
+    PINNED_LINUX_X86_64_FFPROBE,
+    _binary,
+    _contact_sheet,
+    verify_media_binary,
+)
 from hflow.ffmpeg._binary import (
     FFMPEG_ENV_VAR,
     FFPROBE_ENV_VAR,
@@ -342,6 +348,10 @@ def test_real_pinned_download_and_version(
     assert resolved_ffprobe == resolved.with_name("ffprobe")
     ffprobe_version_line = ffprobe_version()
     assert PINNED_VERSION_LABEL in ffprobe_version_line
+    if platform.machine() == "x86_64":
+        verified_ffmpeg = verify_media_binary(resolved, PINNED_LINUX_X86_64_FFMPEG)
+        verified_ffprobe = verify_media_binary(resolved_ffprobe, PINNED_LINUX_X86_64_FFPROBE)
+        assert verified_ffmpeg.version == verified_ffprobe.version
 
 
 def _synthetic_frames(

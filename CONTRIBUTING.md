@@ -139,7 +139,9 @@ archives. The `pinned-assets` workflow runs it weekly on Mondays and supports
 manual dispatch. The publish workflow repeats it before building distributions.
 The separate
 `test_real_pinned_download_and_version` downloads into an isolated cache and
-executes both binaries for the host architecture. Run it when changing the
+executes both binaries for the host architecture. On Linux x86-64 it also
+checks both offline verification specifications against the downloaded binaries;
+the publish workflow runs this check before building distributions. Run it when changing the
 pin, and independently download, hash, and inspect the other architecture's
 archive. Select the last successful BtbN build of a completed month from its
 release list: these are retained for two years, while ordinary daily builds

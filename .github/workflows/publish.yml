@@ -28,6 +28,10 @@ jobs:
         env:
           HFLOW_NETWORK_TESTS: "1"
         run: uv run --locked pytest tests/test_ffmpeg.py::test_pinned_release_assets_available -q
+      - name: Verify downloaded binaries match the offline specifications
+        env:
+          HFLOW_NETWORK_TESTS: "1"
+        run: uv run --locked pytest tests/test_ffmpeg.py::test_real_pinned_download_and_version -q
       - name: Build distributions
         run: uv build
       - name: Smoke-test the wheel in a clean environment
