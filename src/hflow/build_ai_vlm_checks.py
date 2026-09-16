@@ -7,8 +7,8 @@ sampled, intervals whichever way the answer was produced. Two executions
 implement the contract and are chosen per registered check:
 
 - :class:`OpenAICompatibleExecution` runs Build AI's published methodology:
-  their exact prompts and response schemas (copied below from the evaluation
-  release) through an OpenAI-compatible vision model you name. The module's
+  their published prompts and answer shapes, validated with strict response
+  schemas through an OpenAI-compatible vision model you name. The module's
   name and the ``build_ai_`` check names record that this is where the
   contract and the reference prompts come from.
 - :class:`HFlowHostedExecution` runs HFlow's hosted checks: fixed, versioned
@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, assert_never
 from urllib.parse import urlsplit
 
 import httpx2
+from pydantic import ValidationError
 
 from hflow._field_guards import (
     require_finite_float,
@@ -55,6 +56,16 @@ from hflow._field_guards import (
 from hflow._version import __version__
 from hflow._video_measurement_toolchain import measure_video_frame_statistics_for_hflow
 from hflow._video_measurements import FrameStatisticsSettings
+from hflow._vlm_boundary import (
+    ACTIVE_MANIPULATION_HOSTED_RESPONSE,
+    HAND_COUNT_HOSTED_RESPONSE,
+    ActiveManipulationAnswer,
+    CompletionResponse,
+    HandCountAnswer,
+    UnparsedResponse,
+    require_bounded_response,
+    strict_response_json,
+)
 from hflow.episode import Episode
 from hflow.fingerprints import step_version_from_contract
 from hflow.steps import (
@@ -177,26 +188,19 @@ class SkippedBlackFrame:
 
 SampledFrameOutcome = VisionModelOutcome | SkippedBlackFrame
 
-HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {"hand_count": {"type": "integer"}},
-    "required": ["hand_count"],
-}
-ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {"answer": {"type": "string", "enum": ["yes", "no"]}},
-    "required": ["answer"],
-}
+HAND_COUNT_RESPONSE_SCHEMA: dict[str, object] = HandCountAnswer.model_json_schema()
+ACTIVE_MANIPULATION_RESPONSE_SCHEMA: dict[str, object] = (
+    ActiveManipulationAnswer.model_json_schema()
+)
 
 
 @dataclass(frozen=True)
 class OpenAICompatibleExecution:
     """Answer a check with Build AI's published prompts through a model you name.
 
-    This is the reference methodology: the prompt and response schema are the
-    ones Build AI released, and the model is whatever the OpenAI-compatible
-    endpoint serves. Changing the model changes the answers but not the
-    contract.
+    This uses Build AI's released prompts and answer shapes with stricter,
+    generated response schemas. The model is whatever the OpenAI-compatible
+    endpoint serves. Changing the model changes the answers but not the contract.
     """
 
     endpoint: str
@@ -346,42 +350,38 @@ def _strip_markdown_code_fence(response_text: str) -> str:
 
 
 def _parse_json_or_scalar(response_text: str) -> object:
+    require_bounded_response(response_text)
     stripped_response = _strip_markdown_code_fence(response_text)
     try:
-        return json.loads(stripped_response)
+        return strict_response_json(stripped_response)
     except json.JSONDecodeError:
         return stripped_response
 
 
 def parse_hand_count_response(response_text: str) -> int:
     """Parse the published structured shape and compatible plain-text answers."""
-    parsed_response = _parse_json_or_scalar(response_text)
-    if isinstance(parsed_response, dict):
-        parsed_response = parsed_response.get("hand_count")
-    if isinstance(parsed_response, bool):
-        raise ValueError("hand count must be 0, 1, or 2")
-    if isinstance(parsed_response, int):
-        hand_count = parsed_response
-    elif isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
-        hand_count = int(parsed_response)
-    else:
-        raise ValueError("hand count must be 0, 1, or 2")
-    if hand_count not in {0, 1, 2}:
-        raise ValueError("hand count must be 0, 1, or 2")
-    return hand_count
+    try:
+        parsed_response = _parse_json_or_scalar(response_text)
+        if not isinstance(parsed_response, dict):
+            if isinstance(parsed_response, str) and re.fullmatch(r"[012]", parsed_response.strip()):
+                parsed_response = int(parsed_response)
+            parsed_response = {"hand_count": parsed_response}
+        return HandCountAnswer.model_validate(parsed_response).hand_count
+    except (ValueError, RecursionError):
+        raise ValueError("hand count must be 0, 1, or 2") from None
 
 
 def parse_active_manipulation_response(response_text: str) -> str:
-    """Parse the published structured shape and compatible plain-text answers."""
-    parsed_response = _parse_json_or_scalar(response_text)
-    if isinstance(parsed_response, dict):
-        parsed_response = parsed_response.get("answer")
-    if not isinstance(parsed_response, str):
-        raise ValueError('active manipulation must be "yes" or "no"')
-    normalized_answer = parsed_response.strip().lower().rstrip(".")
-    if normalized_answer not in {"yes", "no"}:
-        raise ValueError('active manipulation must be "yes" or "no"')
-    return normalized_answer
+    """Parse strict structured answers or the supported plain-text yes/no mode."""
+    try:
+        parsed_response = _parse_json_or_scalar(response_text)
+        if not isinstance(parsed_response, dict):
+            if isinstance(parsed_response, str):
+                parsed_response = parsed_response.strip().lower().rstrip(".")
+            parsed_response = {"answer": parsed_response}
+        return ActiveManipulationAnswer.model_validate(parsed_response).answer
+    except (ValueError, RecursionError):
+        raise ValueError('active manipulation must be "yes" or "no"') from None
 
 
 def parse_task_response(task: EvaluationTask, response_text: str) -> int | str:
@@ -462,23 +462,20 @@ def _response_format_payload(
 
 
 def _chat_completion_response_text(response: object) -> str:
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError("endpoint returned no completion choices")
-    message = getattr(choices[0], "message", None)
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
+    try:
+        parsed_response = CompletionResponse.model_validate(response)
+    except ValidationError:
+        raise ValueError("endpoint returned no unique completed answer") from None
+    message = parsed_response.choices[0].message
+    if message.refusal or message.tool_calls:
+        raise ValueError("endpoint refused the answer or requested a tool")
+    content = message.content
     if isinstance(content, list):
-        text_parts: list[str] = []
-        for content_part in content:
-            if isinstance(content_part, dict) and isinstance(content_part.get("text"), str):
-                text_parts.append(content_part["text"])
-            elif isinstance(getattr(content_part, "text", None), str):
-                text_parts.append(content_part.text)
-        if text_parts:
-            return "".join(text_parts)
-    raise ValueError("endpoint returned no text completion content")
+        content = "".join(part.text for part in content)
+    if not isinstance(content, str) or not content:
+        raise ValueError("endpoint returned no text completion content")
+    require_bounded_response(content)
+    return content
 
 
 def _response_metadata(response: object) -> ModelResponseMetadata:
@@ -720,9 +717,10 @@ def evaluate_image_with_model(
         request_parameters["temperature"] = temperature
 
     response = client.chat.completions.create(**request_parameters)
-    raw_response = _chat_completion_response_text(response)
+    raw_response = ""
     response_metadata = _response_metadata(response)
     try:
+        raw_response = _chat_completion_response_text(response)
         predicted_value = parse_task_response(task_definition.task, raw_response)
     except ValueError as error:
         return UnparsedVisionModelOutcome(
@@ -779,60 +777,33 @@ def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
     return bytes(response_body)
 
 
-def _parse_hosted_prediction(task: EvaluationTask, value: object) -> int | str:
-    match task:
-        case EvaluationTask.HAND_COUNT:
-            if isinstance(value, bool) or not isinstance(value, int) or value not in {0, 1, 2}:
-                raise RuntimeError(
-                    "HFlow hosted hand-visibility check returned a parsed prediction "
-                    "outside 0, 1, or 2"
-                )
-            return value
-        case EvaluationTask.ACTIVE_MANIPULATION:
-            if not isinstance(value, str) or value not in {"yes", "no"}:
-                raise RuntimeError(
-                    "HFlow hosted active-manipulation check returned a parsed prediction other "
-                    'than "yes" or "no"'
-                )
-            return value
-        case EvaluationTask.BOTH:
-            raise AssertionError("BOTH is a CLI selection, not an executable task")
-
-
 def _parse_hosted_check_response(
     task: EvaluationTask,
     response_payload: object,
 ) -> VisionModelOutcome:
-    if not isinstance(response_payload, dict):
-        raise RuntimeError("HFlow hosted check returned JSON that is not an object")
-    raw_response = response_payload.get("raw_response")
-    if not isinstance(raw_response, str):
-        raise RuntimeError("HFlow hosted check response is missing string field 'raw_response'")
+    match task:
+        case EvaluationTask.HAND_COUNT:
+            response_adapter = HAND_COUNT_HOSTED_RESPONSE
+        case EvaluationTask.ACTIVE_MANIPULATION:
+            response_adapter = ACTIVE_MANIPULATION_HOSTED_RESPONSE
+        case EvaluationTask.BOTH:
+            raise AssertionError("BOTH is a CLI selection, not an executable task")
+    try:
+        parsed_response = response_adapter.validate_python(response_payload)
+    except ValidationError:
+        raise RuntimeError("HFlow hosted check returned an invalid response") from None
     response_metadata = ModelResponseMetadata(response_model=None, usage={})
-    outcome_kind = response_payload.get("outcome")
-    match outcome_kind:
-        case "parsed":
-            predicted_value = _parse_hosted_prediction(task, response_payload.get("prediction"))
-            return ParsedVisionModelOutcome(
-                raw_response=raw_response,
-                response_metadata=response_metadata,
-                predicted_value=predicted_value,
-            )
-        case "unparsed":
-            parse_error = response_payload.get("parse_error")
-            if not isinstance(parse_error, str) or not parse_error:
-                raise RuntimeError(
-                    "HFlow hosted unparsed outcome is missing non-empty string field 'parse_error'"
-                )
-            return UnparsedVisionModelOutcome(
-                raw_response=raw_response,
-                response_metadata=response_metadata,
-                parse_error=parse_error,
-            )
-        case _:
-            raise RuntimeError(
-                "HFlow hosted check response field 'outcome' must be 'parsed' or 'unparsed'"
-            )
+    if isinstance(parsed_response, UnparsedResponse):
+        return UnparsedVisionModelOutcome(
+            raw_response=parsed_response.raw_response,
+            response_metadata=response_metadata,
+            parse_error=parsed_response.parse_error,
+        )
+    return ParsedVisionModelOutcome(
+        raw_response=parsed_response.raw_response,
+        response_metadata=response_metadata,
+        predicted_value=parsed_response.prediction,
+    )
 
 
 def _evaluate_image_with_hflow_hosted_service(
@@ -885,9 +856,9 @@ def _evaluate_image_with_hflow_hosted_service(
     except UnicodeDecodeError as error:
         raise RuntimeError("HFlow hosted check returned invalid UTF-8") from error
     try:
-        response_payload = json.loads(response_text)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("HFlow hosted check returned malformed JSON") from error
+        response_payload = strict_response_json(response_text)
+    except (ValueError, RecursionError):
+        raise RuntimeError("HFlow hosted check returned malformed JSON") from None
     return _parse_hosted_check_response(task, response_payload)
 
 
@@ -899,11 +870,10 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
         "camera": configuration.camera,
         "frame_time_seconds": configuration.frame_time_seconds,
     }
-    # Sampling changes which frames produce results, so it is version-worthy;
-    # the single-frame contract keeps its shape so existing versions hold.
-    contract_name = "build-ai-single-frame-v1"
+    # Strict answer shapes and completion checks change accepted observations.
+    contract_name = "build-ai-single-frame-v2"
     if configuration.sampling is not None:
-        contract_name = "build-ai-sampled-frames-v1"
+        contract_name = "build-ai-sampled-frames-v2"
         version_contract["sampling"] = {
             "fps": configuration.sampling.fps,
             "start_s": configuration.sampling.start_s,

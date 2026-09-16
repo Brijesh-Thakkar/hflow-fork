@@ -131,6 +131,20 @@ answers with HFlow's hosted implementation, whose implementation is pinned per
 version and is not required to match Build AI's. Every result
 names what answered it in `requested_model`.
 
+Structured answers are validated against the same typed models that generate
+their JSON schemas. Hand counts must be integers from 0 through 2, and active
+manipulation answers must be `yes` or `no`. Unknown answer fields, duplicate JSON
+keys, nonfinite numbers, and responses larger than 64 KiB are rejected. Plain-text
+response mode still accepts a count or a yes/no answer; structured fields are not
+coerced from strings or normalized from other labels.
+
+Only one completed, non-refused OpenAI-compatible answer can produce a prediction.
+Truncated, filtered, refused, tool-calling, or ambiguous completions become
+unparsed observations, as do invalid answer values. Transport errors still fail
+the check. Structured validation errors expose a generic reason rather than raw
+validator input details. These acceptance rules change both single-frame and
+sampled check versions; recompute checks when comparing results across versions.
+
 The same checks are available directly in any pipeline. Execution is selected
 per check, so the two checks may use different executions:
 

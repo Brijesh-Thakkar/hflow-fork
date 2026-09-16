@@ -427,7 +427,7 @@ def test_hosted_unparsed_response_remains_an_evaluation_outcome() -> None:
 def test_hosted_response_refuses_a_prediction_outside_the_check_contract(
     prediction: object,
 ) -> None:
-    with pytest.raises(RuntimeError, match="outside 0, 1, or 2"):
+    with pytest.raises(RuntimeError, match="invalid response"):
         hflow.build_ai_vlm_checks._parse_hosted_check_response(
             hflow.build_ai_vlm_checks.EvaluationTask.HAND_COUNT,
             {
@@ -533,14 +533,14 @@ def test_registration_refuses_invalid_frame_times(tmp_path: Path, value: Any) ->
 
 
 @pytest.mark.parametrize(
-    "value", [True, False, -1, 3, 1.0, None, "01", "3", float("nan"), float("inf")]
+    "value", [True, False, -1, 3, 1.0, None, "0", "1", "2", "01", "3", float("nan"), float("inf")]
 )
 def test_hand_count_response_refuses_invalid_numbers(value: object) -> None:
     with pytest.raises(ValueError, match=r"^hand count must be 0, 1, or 2$"):
         hflow.build_ai_vlm_checks.parse_hand_count_response(json.dumps({"hand_count": value}))
 
 
-@pytest.mark.parametrize("value", [0, 1, 2, "0", "1", "2", " 1 "])
+@pytest.mark.parametrize("value", [0, 1, 2])
 def test_hand_count_response_accepts_integer_and_text_counts(value: int | str) -> None:
     assert hflow.build_ai_vlm_checks.parse_hand_count_response(
         json.dumps({"hand_count": value})
@@ -624,10 +624,10 @@ def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Pa
 # Editing these strings is the signal, not the chore. Change them only
 # together with a deliberate contract change, and say in the PR why every
 # existing Build AI result is being invalidated.
-_GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v1-2aed30388241d554"
+_GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v2-d9a739c8f3f88364"
 # Re-minted when HFlowHostedExecution gained max_retries: like the OpenAI
 # branch's max_retries (#404), it decides which frames produce a result at all.
-_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v1-fa8da9fd481bfc4d"
+_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v2-3113f834d97a38b0"
 
 
 def test_check_version_is_pinned_for_a_fixed_openai_configuration(tmp_path: Path) -> None:
@@ -730,3 +730,90 @@ def test_check_version_applies_the_rule_symmetrically_across_branches(
     )
     assert openai_versions[0] != openai_versions[1]
     assert hosted_versions[0] != hosted_versions[1]
+
+
+@pytest.mark.parametrize(
+    ("task", "response_text"),
+    [
+        ("hand-count", '{"hand_count":0,"hand_count":2}'),
+        ("active-manipulation", '{"answer":"no","answer":"yes"}'),
+        ("hand-count", '{"hand_count":2,"extra":NaN}'),
+        ("hand-count", '{"hand_count":2,"extra":1e999}'),
+        ("hand-count", '{"hand_count":2,"extra":1}'),
+        ("hand-count", " " * (64 * 1024) + "2"),
+        ("hand-count", "\ud800"),
+        ("active-manipulation", '{"answer":"YES"}'),
+    ],
+)
+def test_model_answers_reject_ambiguous_or_out_of_contract_json(
+    task: str, response_text: str
+) -> None:
+    checks = hflow.build_ai_vlm_checks
+    with pytest.raises(ValueError) as captured_error:
+        checks.parse_task_response(checks.EvaluationTask(task), response_text)
+    assert captured_error.value.__cause__ is None
+    assert captured_error.value.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    ("task", "response_text", "expected"),
+    [("hand-count", " 2 ", 2), ("active-manipulation", "NO.", "no")],
+)
+def test_plain_text_response_mode_remains_explicitly_supported(
+    task: str, response_text: str, expected: int | str
+) -> None:
+    checks = hflow.build_ai_vlm_checks
+    assert checks.parse_task_response(checks.EvaluationTask(task), response_text) == expected
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "refusal", "tool_calls", "choice_count", "accepted"),
+    [
+        ("stop", None, None, 1, True),
+        ("length", None, None, 1, False),
+        ("content_filter", None, None, 1, False),
+        (None, None, None, 1, False),
+        ("stop", "cannot answer", None, 1, False),
+        ("stop", None, [{"id": "tool"}], 1, False),
+        ("stop", None, None, 2, False),
+        ("stop", None, None, 0, False),
+    ],
+)
+def test_only_one_complete_nonrefused_completion_produces_a_prediction(
+    finish_reason: str | None,
+    refusal: str | None,
+    tool_calls: list[object] | None,
+    choice_count: int,
+    accepted: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    checks = hflow.build_ai_vlm_checks
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(
+                    content='{"hand_count":2}', refusal=refusal, tool_calls=tool_calls
+                ),
+            )
+        ]
+        * choice_count
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_arguments: response))
+    )
+    outcome = checks.evaluate_image_with_model(
+        client=client,
+        model="model",
+        task_definition=checks.load_task_definitions()[checks.EvaluationTask.HAND_COUNT],
+        image_data_url="data:image/png;base64,fixture",
+        response_format=checks.ResponseFormat.JSON_SCHEMA,
+        temperature=None,
+        max_tokens=32,
+    )
+    assert isinstance(outcome, checks.ParsedVisionModelOutcome) is accepted
+    if isinstance(outcome, checks.ParsedVisionModelOutcome):
+        assert outcome.predicted_value == 2
+    else:
+        assert "ValidationError" not in outcome.parse_error
