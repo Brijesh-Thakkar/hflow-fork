@@ -2047,68 +2047,38 @@ def test_non_scalar_measurement_is_refused_naming_the_check_and_key(
         )
 
 
-def test_measurement_key_claiming_an_episode_column_is_refused(tmp_path: Path) -> None:
-    """A key named like an episodes column would pivot into <key>_1 beside it."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="claims_task",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements={"task": 99.0},
-    )
-    with pytest.raises(ValueError, match=r"'claims_task'.*'task'"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
+@pytest.mark.parametrize(
+    ("check_name", "measurement_key", "expected_message"),
+    [
+        pytest.param(
+            "claims_task", "task", r"'claims_task'.*'task'", id="claims-an-episodes-column"
+        ),
+        pytest.param("empty_key_check", "", r"'empty_key_check'.*''", id="empty"),
+        pytest.param("blank_key_check", "   ", r"'blank_key_check'", id="whitespace-only"),
+    ],
+)
+def test_a_measurement_key_that_cannot_become_a_column_is_refused(
+    check_name: str, measurement_key: str, expected_message: str, tmp_path: Path
+) -> None:
+    """Every measurement key has to survive the pivot into a wide-view column (#160).
 
-
-def test_empty_measurement_key_is_refused(tmp_path: Path) -> None:
-    """No empty measurement key may become a wide-view column (#160).
-
-    An empty key would pivot into a column whose name is the SQL expression
-    that produced it -- a queryable surface with no name a person would write
-    and no rename path (docs/CATALOG.md, "Naming measurement keys").
+    A key named like an episodes column pivots into ``<key>_1`` beside it. An
+    empty or whitespace-only key pivots into a column named for the SQL
+    expression that produced it, which is a queryable surface with no name a
+    person would write and no rename path (docs/CATALOG.md, "Naming
+    measurement keys").
     """
     canonical = tmp_path / "e.canonical.mcap"
     canonical.write_bytes(b"episode-bytes")
     row = CheckRunRow(
-        check_name="empty_key_check",
+        check_name=check_name,
         check_version="v1",
         critical=False,
         status=hflow.CheckStatus.MEASURED,
         duration_s=0.1,
-        measurements={"": 1.0},
+        measurements={measurement_key: 99.0},
     )
-    with pytest.raises(ValueError, match=r"'empty_key_check'.*''"):
-        Catalog(tmp_path / "catalog").append_episode(
-            canonical_path=canonical,
-            stamps=FAKE_STAMPS,
-            episode_metadata={},
-            check_rows=[row],
-        )
-    assert list((tmp_path / "catalog" / "episodes").glob("*.parquet")) == []
-
-
-def test_whitespace_only_measurement_key_is_refused(tmp_path: Path) -> None:
-    """Whitespace-only keys have the same "no name a person would write" problem (#160)."""
-    canonical = tmp_path / "e.canonical.mcap"
-    canonical.write_bytes(b"episode-bytes")
-    row = CheckRunRow(
-        check_name="blank_key_check",
-        check_version="v1",
-        critical=False,
-        status=hflow.CheckStatus.MEASURED,
-        duration_s=0.1,
-        measurements={"   ": 1.0},
-    )
-    with pytest.raises(ValueError, match=r"'blank_key_check'"):
+    with pytest.raises(ValueError, match=expected_message):
         Catalog(tmp_path / "catalog").append_episode(
             canonical_path=canonical,
             stamps=FAKE_STAMPS,

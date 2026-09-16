@@ -1112,48 +1112,19 @@ def test_contact_sheet_rejects_non_positive_dimensions_before_ffmpeg(
         contact_sheet([_unreadable_frame(tmp_path)], tmp_path / "never.jpg", **{parameter: value})
 
 
-@pytest.mark.parametrize("columns", [True, False, 1.0, "1", None])
-def test_contact_sheet_rejects_non_integer_columns_before_ffmpeg(
-    columns: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parameter", ["columns", "tile_width", "max_tiles"])
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", None])
+def test_contact_sheet_rejects_non_integer_dimensions_before_ffmpeg(
+    parameter: str, value: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
     with pytest.raises(
-        ValueError, match=rf"^columns must be an int, got {type(columns).__name__}$"
+        ValueError, match=rf"^{parameter} must be an int, got {type(value).__name__}$"
     ):
         contact_sheet(
             [_unreadable_frame(tmp_path)],
             tmp_path / "never.jpg",
-            columns=columns,  # ty: ignore[invalid-argument-type]
-        )
-
-
-@pytest.mark.parametrize("tile_width", [True, False, 1.0, "1", None])
-def test_contact_sheet_rejects_non_integer_tile_width_before_ffmpeg(
-    tile_width: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(
-        ValueError, match=rf"^tile_width must be an int, got {type(tile_width).__name__}$"
-    ):
-        contact_sheet(
-            [_unreadable_frame(tmp_path)],
-            tmp_path / "never.jpg",
-            tile_width=tile_width,  # ty: ignore[invalid-argument-type]
-        )
-
-
-@pytest.mark.parametrize("max_tiles", [True, False, 1.0, "1", None])
-def test_contact_sheet_rejects_non_integer_max_tiles_before_ffmpeg(
-    max_tiles: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _refuse_ffmpeg_for_invalid_contact_sheet_arguments(monkeypatch)
-    with pytest.raises(
-        ValueError, match=rf"^max_tiles must be an int, got {type(max_tiles).__name__}$"
-    ):
-        contact_sheet(
-            [_unreadable_frame(tmp_path)],
-            tmp_path / "never.jpg",
-            max_tiles=max_tiles,  # ty: ignore[invalid-argument-type]
+            **{parameter: value},  # ty: ignore[invalid-argument-type]
         )
 
 
