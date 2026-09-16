@@ -57,6 +57,26 @@ Guide: [Run HFlow inside a worker](../docs/how-to/run-embedded-workers.md)
 
 Code: [`embedded_worker.py`](./embedded_worker.py)
 
+## Original source frame sampling
+
+**Use it for:** covering a local video with complete windows and extracting
+bounded previews with actual source timestamps.
+
+**Prerequisites:** the root uv environment, a local video, and FFmpeg/ffprobe.
+HFlow may download its managed binaries; no model service or credentials are used.
+
+```bash
+uv run python examples/sample_source_video.py recording.mp4 \
+    --output data/source-frames --mode keyframes_first
+```
+
+The example writes JPEGs into a new output directory and prints JSON for each
+window. It preserves the source and reports keyframe fallback explicitly.
+
+Guide: [Sample original video frames](../docs/how-to/sample-source-video.md)
+
+Code: [`sample_source_video.py`](./sample_source_video.py)
+
 ## Continuous camera motion
 
 **Use it for:** streaming per-frame-pair motion and optional continuous shake

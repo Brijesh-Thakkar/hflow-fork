@@ -10,7 +10,12 @@ def smoke_test_lazy_imports() -> None:
     # Access modules first: later symbol imports also populate package attributes.
     batching_module = hflow.batching
     statistics_module = hflow.statistics
-    from hflow import WeightedValue, plan_batches, summarize_weighted_distribution
+    from hflow import (
+        WeightedValue,
+        plan_batches,
+        plan_source_windows,
+        summarize_weighted_distribution,
+    )
 
     assert plan_batches is batching_module.plan_batches
     assert WeightedValue is statistics_module.WeightedValue
@@ -26,6 +31,8 @@ def smoke_test_lazy_imports() -> None:
     assert distribution is not None
     assert distribution.mean == 65
     assert distribution.total_weight == 4
+    windows = plan_source_windows(120_001, maximum_window_millis=120_000)
+    assert [window.duration_millis for window in windows] == [60_001, 60_000]
     assert "App" in dir(hflow)
     assert not hasattr(hflow, "missing_public_export")
     allowed_modules = {
@@ -34,6 +41,7 @@ def smoke_test_lazy_imports() -> None:
         "hflow._field_guards",
         "hflow.batching",
         "hflow.statistics",
+        "hflow.source_windows",
     }
     loaded_modules = {
         module_name
