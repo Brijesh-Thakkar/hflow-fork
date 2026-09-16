@@ -120,8 +120,20 @@ OpenAI-compatible checks can use different services through the
 `BUILD_AI_HAND_VISIBILITY_API_KEY_ENV` and corresponding
 `BUILD_AI_ACTIVE_MANIPULATION_*` overrides.
 
-`HFlowHostedExecution` owns only the hosted base URL, check version, and request
-timeout; its server owns every model setting.
+`HFlowHostedExecution` owns the hosted base URL, check version, and request policy;
+its server owns every model setting. `request_timeout_seconds` defaults to 60,
+`total_timeout_seconds` to 360, and `max_retries` to five additional attempts.
+Tenacity retries transport failures and HTTP 429/502/503/504, respecting numeric
+`Retry-After` delays (capped at 120 seconds) or exponential backoff. Authorization
+errors, malformed responses, and invalid predictions are not retried.
+
+The total budget includes attempts, response reads, and backoff. A retry whose
+delay would exhaust the budget is refused. The budget is checked before attempts
+and after streamed reads; socket timeouts are capped by the remaining budget at
+the start of each attempt. This synchronous interface checks elapsed time at I/O
+boundaries, so an in-flight socket operation can finish after the budget, but its
+late response is rejected. A 64 KiB response limit also applies. Both timeout
+settings and the retry count enter the check version.
 
 The two checks are contracts, not a particular model: one egocentric frame in,
 a hand count of 0, 1, or 2 or a yes/no on active manipulation out, recorded as

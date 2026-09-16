@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import TracebackType
@@ -464,6 +465,7 @@ def test_hosted_response_refuses_a_prediction_outside_the_check_contract(
         (hflow.build_ai_vlm_checks.HFlowHostedExecution, "max_retries", -1, 0),
         (hflow.build_ai_vlm_checks.HFlowHostedExecution, "check_version", 0, 1),
         (hflow.build_ai_vlm_checks.HFlowHostedExecution, "request_timeout_seconds", 0, 0.5),
+        (hflow.build_ai_vlm_checks.HFlowHostedExecution, "total_timeout_seconds", 0, 0.5),
         (hflow.build_ai_vlm_checks.FrameSampling, "fps", 0, 0.5),
         (hflow.build_ai_vlm_checks.FrameSampling, "start_s", -1, 0),
         (partial(hflow.build_ai_vlm_checks.FrameSampling, start_s=2), "end_s", 2, 3),
@@ -627,7 +629,7 @@ def test_check_version_stable_when_every_covered_field_is_identical(tmp_path: Pa
 _GOLDEN_OPENAI_CHECK_VERSION = "build-ai-single-frame-v2-d9a739c8f3f88364"
 # Re-minted when HFlowHostedExecution gained max_retries: like the OpenAI
 # branch's max_retries (#404), it decides which frames produce a result at all.
-_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v2-3113f834d97a38b0"
+_GOLDEN_HOSTED_CHECK_VERSION = "build-ai-single-frame-v2-5c2e7b10be83c45a"
 
 
 def test_check_version_is_pinned_for_a_fixed_openai_configuration(tmp_path: Path) -> None:
@@ -681,21 +683,22 @@ def test_check_version_changes_with_max_retries(tmp_path: Path) -> None:
     assert first_application.checks[0].version != second_application.checks[0].version
 
 
-def test_check_version_changes_with_request_timeout_seconds(tmp_path: Path) -> None:
+@pytest.mark.parametrize("timeout_field", ["request_timeout_seconds", "total_timeout_seconds"])
+def test_check_version_changes_with_timeout(tmp_path: Path, timeout_field: str) -> None:
     """The hosted branch applies the same rule: a timeout decides whether a
     slow-but-valid response is included, so the field belongs in identity."""
     first_application = hflow.App("first", data_root=tmp_path / "first", default_checks=())
     second_application = hflow.App("second", data_root=tmp_path / "second", default_checks=())
     hflow.build_ai_vlm_checks.register_hand_visibility(
         first_application,
-        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
-            check_version=1, request_timeout_seconds=1.0
+        execution=replace(
+            hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **{timeout_field: 1.0}
         ),
     )
     hflow.build_ai_vlm_checks.register_hand_visibility(
         second_application,
-        execution=hflow.build_ai_vlm_checks.HFlowHostedExecution(
-            check_version=1, request_timeout_seconds=60.0
+        execution=replace(
+            hflow.build_ai_vlm_checks.HFlowHostedExecution(check_version=1), **{timeout_field: 60.0}
         ),
     )
 
@@ -817,3 +820,133 @@ def test_only_one_complete_nonrefused_completion_produces_a_prediction(
         assert outcome.predicted_value == 2
     else:
         assert "ValidationError" not in outcome.parse_error
+
+
+@pytest.fixture
+def hosted_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    elapsed_seconds = [0.0]
+    monkeypatch.setattr(hflow.build_ai_vlm_checks.time, "monotonic", lambda: elapsed_seconds[0])
+
+    def advance_clock(seconds: float) -> None:
+        elapsed_seconds[0] += seconds
+
+    monkeypatch.setattr(hflow.build_ai_vlm_checks.time, "sleep", advance_clock)
+    return elapsed_seconds
+
+
+def _hosted_success_response() -> httpx2.Response:
+    return httpx2.Response(
+        200,
+        json={"outcome": "parsed", "prediction": 2, "raw_response": "2"},
+        request=httpx2.Request("POST", "https://checks.example/evaluate"),
+    )
+
+
+def _evaluate_hosted_hand_count(
+    **configuration: Any,
+) -> hflow.build_ai_vlm_checks.VisionModelOutcome:
+    checks = hflow.build_ai_vlm_checks
+    return checks._evaluate_image_with_hflow_hosted_service(
+        execution=checks.HFlowHostedExecution(**configuration),
+        task=checks.EvaluationTask.HAND_COUNT,
+        image_bytes=b"\xff\xd8\xffsynthetic-image",
+    )
+
+
+@pytest.mark.parametrize("status_code", [429, 502, 503, 504, None])
+def test_hosted_retry_recovers_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    hosted_clock: list[float],
+    status_code: int | None,
+) -> None:
+    from contextlib import contextmanager
+
+    responses = iter((status_code, 200))
+
+    @contextmanager
+    def respond(*_arguments: object, **_keyword_arguments: object) -> Iterator[httpx2.Response]:
+        next_status = next(responses)
+        if next_status is None:
+            raise httpx2.ConnectError("connection interrupted")
+        response = (
+            _hosted_success_response()
+            if next_status == 200
+            else httpx2.Response(
+                next_status,
+                headers={"Retry-After": "2"},
+                request=httpx2.Request("POST", "https://checks.example/evaluate"),
+            )
+        )
+        try:
+            yield response
+        finally:
+            response.close()
+
+    monkeypatch.setattr(httpx2, "stream", respond)
+    outcome = _evaluate_hosted_hand_count()
+    assert isinstance(outcome, hflow.build_ai_vlm_checks.ParsedVisionModelOutcome)
+    assert outcome.predicted_value == 2
+    assert hosted_clock[0] == (1 if status_code is None else 2)
+
+
+@pytest.mark.parametrize("failure", ["authorization", "malformed", "exhausted", "retry-budget"])
+def test_hosted_request_does_not_turn_terminal_failures_into_success(
+    monkeypatch: pytest.MonkeyPatch,
+    hosted_clock: list[float],
+    failure: str,
+) -> None:
+    from contextlib import contextmanager
+
+    failure_responses = {
+        "authorization": [httpx2.Response(401)],
+        "malformed": [
+            httpx2.Response(
+                200,
+                content=b'{"outcome":"parsed","prediction":0,"prediction":2,"raw_response":"2"}',
+            )
+        ],
+        "exhausted": [httpx2.Response(503), httpx2.Response(503)],
+        "retry-budget": [httpx2.Response(503, headers={"Retry-After": "10"})],
+    }
+    responses = iter([*failure_responses[failure], _hosted_success_response()])
+
+    @contextmanager
+    def respond(*_arguments: object, **_keyword_arguments: object) -> Iterator[httpx2.Response]:
+        response = next(responses)
+        response.request = httpx2.Request("POST", "https://checks.example/private-input")
+        try:
+            yield response
+        finally:
+            response.close()
+
+    monkeypatch.setattr(httpx2, "stream", respond)
+    with pytest.raises(RuntimeError) as captured_error:
+        _evaluate_hosted_hand_count(max_retries=1, total_timeout_seconds=5)
+    assert "private-input" not in str(captured_error.value)
+    assert captured_error.value.__cause__ is None
+    assert hosted_clock[0] == (1 if failure == "exhausted" else 0)
+
+
+def test_hosted_response_that_crosses_the_total_budget_is_not_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    hosted_clock: list[float],
+) -> None:
+    class SlowHostedResponse(_StubHostedResponse):
+        def iter_bytes(self) -> Iterator[bytes]:
+            yield self._body[:1]
+            hosted_clock[0] += 6
+            yield self._body[1:]
+
+    monkeypatch.setattr(
+        httpx2,
+        "stream",
+        lambda *_arguments, **_keyword_arguments: SlowHostedResponse(
+            {
+                "outcome": "parsed",
+                "prediction": 2,
+                "raw_response": "2",
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError, match="total timeout"):
+        _evaluate_hosted_hand_count(total_timeout_seconds=5)

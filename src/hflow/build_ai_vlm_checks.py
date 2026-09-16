@@ -45,6 +45,13 @@ from urllib.parse import urlsplit
 
 import httpx2
 from pydantic import ValidationError
+from tenacity import (
+    RetryCallState,
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    stop_before_delay,
+)
 
 from hflow._field_guards import (
     require_finite_float,
@@ -136,7 +143,30 @@ def _hosted_retry_delay_seconds(retry_after_header: str | None, attempt: int) ->
             requested_delay = None
         if requested_delay is not None and math.isfinite(requested_delay) and requested_delay >= 0:
             return min(requested_delay, _MAX_HOSTED_RETRY_DELAY_SECONDS)
-    return min(float(2**attempt), _MAX_HOSTED_RETRY_DELAY_SECONDS)
+    return min(float(2 ** min(attempt, 7)), _MAX_HOSTED_RETRY_DELAY_SECONDS)
+
+
+def _retryable_hosted_failure(error: BaseException) -> bool:
+    if isinstance(error, httpx2.HTTPStatusError):
+        return error.response.status_code in _RETRYABLE_HOSTED_STATUS_CODES
+    return isinstance(error, httpx2.RequestError)
+
+
+def _hosted_retry_wait(retry_state: RetryCallState) -> float:
+    error = retry_state.outcome.exception() if retry_state.outcome is not None else None
+    retry_after = (
+        error.response.headers.get("Retry-After")
+        if isinstance(error, httpx2.HTTPStatusError)
+        else None
+    )
+    return _hosted_retry_delay_seconds(retry_after, retry_state.attempt_number - 1)
+
+
+def _remaining_hosted_seconds(deadline: float) -> float:
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        raise RuntimeError("HFlow hosted check exceeded its total timeout")
+    return remaining_seconds
 
 
 class EvaluationTask(StrEnum):
@@ -247,6 +277,7 @@ class HFlowHostedExecution:
     base_url: str = DEFAULT_HFLOW_HOSTED_BASE_URL
     check_version: int = _DEFAULT_HFLOW_HOSTED_CHECK_VERSION
     request_timeout_seconds: float = 60.0
+    total_timeout_seconds: float = 360.0
     # Retries for transient failures only (429, 502, 503, 504, transport
     # errors), each after the server's Retry-After or an exponential delay. A
     # sampled check makes one request per frame, so one gateway timeout must
@@ -261,6 +292,7 @@ class HFlowHostedExecution:
             raise ValueError("base_url must not contain a query string or fragment")
         require_positive_int(self.check_version, "check_version")
         require_positive_float(self.request_timeout_seconds, "request_timeout_seconds")
+        require_positive_float(self.total_timeout_seconds, "total_timeout_seconds")
 
 
 BuildAIExecution = OpenAICompatibleExecution | HFlowHostedExecution
@@ -768,12 +800,14 @@ def _hosted_observation_upload(image_bytes: bytes) -> tuple[str, bytes, str]:
     return filename, image_bytes, image_mime_type
 
 
-def _read_bounded_hosted_response(response: httpx2.Response) -> bytes:
+def _read_bounded_hosted_response(response: httpx2.Response, *, deadline: float) -> bytes:
     response_body = bytearray()
     for response_chunk in response.iter_bytes():
+        _remaining_hosted_seconds(deadline)
         if len(response_body) + len(response_chunk) > _MAX_HFLOW_HOSTED_RESPONSE_BYTES:
             raise RuntimeError("HFlow hosted check response exceeds the 64 KiB limit")
         response_body.extend(response_chunk)
+    _remaining_hosted_seconds(deadline)
     return bytes(response_body)
 
 
@@ -815,46 +849,47 @@ def _evaluate_image_with_hflow_hosted_service(
     if len(image_bytes) > _MAX_HFLOW_HOSTED_IMAGE_BYTES:
         raise ValueError("HFlow hosted check observation exceeds the 10 MiB image limit")
     endpoint = _hosted_check_endpoint(execution, task)
+    deadline = time.monotonic() + execution.total_timeout_seconds
     response_bytes: bytes | None = None
-    for attempt in range(execution.max_retries + 1):
-        is_last_attempt = attempt == execution.max_retries
-        try:
-            with httpx2.stream(
-                "POST",
-                endpoint,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": _HFLOW_HOSTED_USER_AGENT,
-                },
-                files={"observation": _hosted_observation_upload(image_bytes)},
-                timeout=execution.request_timeout_seconds,
-                # An image-bearing API request must never follow a redirect to another origin.
-                follow_redirects=False,
-            ) as response:
-                response.raise_for_status()
-                response_bytes = _read_bounded_hosted_response(response)
-            break
-        except httpx2.HTTPStatusError as error:
-            retry_after = error.response.headers.get("Retry-After")
-            status_code = error.response.status_code
-            if status_code in _RETRYABLE_HOSTED_STATUS_CODES and not is_last_attempt:
-                time.sleep(_hosted_retry_delay_seconds(retry_after, attempt))
-                continue
-            retry_after_suffix = f"; retry after {retry_after}" if retry_after else ""
-            raise RuntimeError(
-                f"HFlow hosted check request failed with HTTP {status_code}{retry_after_suffix}"
-            ) from error
-        except httpx2.RequestError as error:
-            if not is_last_attempt:
-                time.sleep(_hosted_retry_delay_seconds(None, attempt))
-                continue
-            raise RuntimeError(f"HFlow hosted check endpoint is unreachable: {error}") from error
+    try:
+        for attempt in Retrying(
+            retry=retry_if_exception(_retryable_hosted_failure),
+            wait=_hosted_retry_wait,
+            stop=(
+                stop_after_attempt(execution.max_retries + 1)
+                | stop_before_delay(execution.total_timeout_seconds)
+            ),
+            sleep=time.sleep,
+            reraise=True,
+        ):
+            with attempt:
+                remaining_seconds = _remaining_hosted_seconds(deadline)
+                with httpx2.stream(
+                    "POST",
+                    endpoint,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": _HFLOW_HOSTED_USER_AGENT,
+                    },
+                    files={"observation": _hosted_observation_upload(image_bytes)},
+                    timeout=min(execution.request_timeout_seconds, remaining_seconds),
+                    # Image-bearing requests must never redirect to another origin.
+                    follow_redirects=False,
+                ) as response:
+                    response.raise_for_status()
+                    response_bytes = _read_bounded_hosted_response(response, deadline=deadline)
+    except httpx2.HTTPStatusError as error:
+        raise RuntimeError(
+            f"HFlow hosted check request failed with HTTP {error.response.status_code}"
+        ) from None
+    except httpx2.RequestError:
+        raise RuntimeError("HFlow hosted check endpoint is unreachable") from None
     if response_bytes is None:
         raise AssertionError("the hosted request loop exits by returning or raising")
     try:
         response_text = response_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise RuntimeError("HFlow hosted check returned invalid UTF-8") from error
+    except UnicodeDecodeError:
+        raise RuntimeError("HFlow hosted check returned invalid UTF-8") from None
     try:
         response_payload = strict_response_json(response_text)
     except (ValueError, RecursionError):
@@ -909,6 +944,7 @@ def _check_version(configuration: _RegisteredBuildAICheckConfiguration) -> StepV
                         execution, configuration.task_definition.task
                     ),
                     "request_timeout_seconds": execution.request_timeout_seconds,
+                    "total_timeout_seconds": execution.total_timeout_seconds,
                     "max_retries": execution.max_retries,
                 }
             )
