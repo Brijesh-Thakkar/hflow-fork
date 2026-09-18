@@ -525,11 +525,11 @@ def test_one_check_with_case_colliding_measurement_keys_is_refused(
     second_key = first_key.replace("Camera", "camera")
 
     @app.check(version="1")
-    def scores(ep: hflow.Episode) -> hflow.CheckResult:
+    async def scores(ep: hflow.Episode) -> hflow.CheckResult:
         return hflow.CheckResult(measurements={first_key: 0.1, second_key: 0.9})
 
     with pytest.raises(ValueError, match=r"measurement keys.*collide") as failure:
-        app.process(_state_only_episode(tmp_path), record=record)
+        asyncio.run(app.process(_state_only_episode(tmp_path), record=record))
 
     message = str(failure.value)
     assert repr(first_key) in message
