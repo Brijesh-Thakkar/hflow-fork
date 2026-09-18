@@ -236,15 +236,10 @@ def fixture_archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
         't(index, episode_index, frame_index, timestamp, "observation.state", action)) '
         f"TO '{dquoted}' (FORMAT parquet)"
     )
-    # The exporter fetches data under the flattened chunk-name too.
-    flattened = data_dir.parent / "chunk-000000-file-000000.parquet"
-    shutil.copy2(data_parquet, flattened)
-
-    videos = root / "videos"
-    videos.mkdir()
-    for cam in CAMS:
-        name = cam.replace("/", "_").replace(".", "_") + "-chunk0-file0.mp4"
-        (videos / name).write_bytes(b"fake-mp4-content")
+    for camera_key in CAMS:
+        video_directory = root / "videos" / camera_key / "chunk-000"
+        video_directory.mkdir(parents=True)
+        (video_directory / "file-000.mp4").write_bytes(b"fake-mp4-content")
     conn.close()
     return root
 

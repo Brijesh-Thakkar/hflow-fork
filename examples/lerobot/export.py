@@ -302,7 +302,7 @@ def _write_v3_repository(
     def _fetch_data(ep: dict) -> Path:
         chunk = int(ep["data_chunk"])
         file = int(ep["data_file"])
-        local = cache_dir / "data" / f"chunk-{chunk:06d}-file-{file:06d}.parquet"
+        local = cache_dir / info["data_path"].format(chunk_index=chunk, file_index=file)
         if not local.exists():
             raise FileNotFoundError(f"source data chunk missing: {local}")
         return local
@@ -310,10 +310,11 @@ def _write_v3_repository(
     def _fetch_video(cam: str, vw: dict) -> Path:
         chunk = _window_index(vw, "chunk_index", cam)
         file = _window_index(vw, "file_index", cam)
-        local = (
-            cache_dir
-            / "videos"
-            / f"{cam.replace('/', '_').replace('.', '_')}-chunk{chunk}-file{file}.mp4"
+        video_path_template = info.get(
+            "video_path", "videos/{camera_key}/{chunk_index:06d}/{file_index:06d}.mp4"
+        )
+        local = cache_dir / video_path_template.format(
+            chunk_index=chunk, file_index=file, video_key=cam, camera_key=cam
         )
         if not local.exists():
             raise FileNotFoundError(f"source video chunk missing: {local}")

@@ -367,7 +367,8 @@ loud before any output is published.
 
 **Prerequisites:** network access to Hugging Face and enough local disk for the
 selected Parquet and video files. HFlow uses its managed FFmpeg build; no
-LeRobot, PyTorch, or Hugging Face SDK installation is required.
+LeRobot or PyTorch installation is required. The Hugging Face Hub SDK ships
+with HFlow.
 
 PushT (single camera, 2-dimensional vectors):
 
@@ -469,8 +470,8 @@ first run takes roughly 30-60 minutes: the export step materializes the
 full pinned source archive through the public importer (`hflow import
 lerobot` with no episode list converts every episode), while the import
 step itself converts only the listed subset. Later runs reuse downloads,
-skip already-converted episodes, and finish much faster. No LeRobot,
-PyTorch, or Hugging Face SDK installation is required.
+skip already-converted episodes, and finish much faster. The Hugging Face Hub
+SDK ships with HFlow; no LeRobot or PyTorch installation is required.
 
 ```bash
 uv run python examples/lerobot/workflow.py
