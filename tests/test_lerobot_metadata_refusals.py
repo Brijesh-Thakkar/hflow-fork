@@ -270,6 +270,48 @@ def test_import_refuses_repository_without_episode_parquets(
     _assert_no_dataset_output(output_dir)
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param({"type": "file", "size": 4096}, id="path-missing"),
+        # A truthy, non-string path (e.g. an integer) passes a bare
+        # `not tree_entry_path` check, then reaches `.endswith` and raises the
+        # bare AttributeError this guard exists to replace. isinstance is
+        # load-bearing, not redundant with the truthiness check.
+        pytest.param({"type": "file", "path": 123}, id="path-not-a-string"),
+    ],
+)
+def test_import_refuses_an_episode_parquet_entry_with_no_usable_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object]
+) -> None:
+    """``_hf_tree`` tolerates a missing or non-string ``path`` (it only dedupes
+    on one when it is a string); the ``meta/episodes`` file loop must not
+    assume it is there or that it is a string."""
+    _stub_repo_info(monkeypatch)
+    monkeypatch.setattr(
+        prep,
+        "_fetch_info_json",
+        lambda _repo, _revision, _cache: {
+            "fps": 30,
+            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            "features": {},
+        },
+    )
+    monkeypatch.setattr(prep, "_hf_tree", lambda _repo, _revision, _path: [entry])
+    output_dir = tmp_path / "out"
+
+    with pytest.raises(
+        ValueError,
+        match=_exactly(
+            f"Hugging Face tree response for {_REPO} lists an entry with no usable 'path'"
+        ),
+    ):
+        _import(output_dir)
+
+    _assert_no_dataset_output(output_dir)
+
+
 def test_import_refuses_tree_response_that_is_not_a_list_of_objects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
