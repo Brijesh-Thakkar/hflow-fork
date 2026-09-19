@@ -921,7 +921,14 @@ def test_cli_positive_integer_bounds_rejected(flag: str, invalid_value: str) -> 
 
 
 def test_cli_help_displays_subcommands_and_options() -> None:
-    runner = CliRunner()
+    # Typer styles an option's ``--`` prefix separately from its name, so with
+    # colour on the rendered text is ``--<ANSI>dataset<ANSI>`` and a plain
+    # ``"--dataset" in output`` is False. This passed locally, where Rich
+    # emitted no colour, and failed on CI, where it did. ``TERM=dumb`` is the
+    # lever that actually turns colour off here; ``NO_COLOR`` does not, because
+    # an explicit colour setting still wins over it. COLUMNS is pinned too so a
+    # narrow terminal cannot wrap a flag out of the assertions separately.
+    runner = CliRunner(env={"COLUMNS": "200", "TERM": "dumb"})
 
     top_help = runner.invoke(evaluate_app, ["--help"])
     assert top_help.exit_code == 0
