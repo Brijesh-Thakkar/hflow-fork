@@ -8,8 +8,10 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
+import httpx2
 import pytest
 
+import hflow.runtime._client as client_module
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
@@ -28,6 +30,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
 
     issued_tokens: ClassVar[list[str]] = []
     requests_seen: ClassVar[list[tuple[str, str, dict[str, Any] | None, str | None]]] = []
+    request_headers_seen: ClassVar[list[dict[str, str]]] = []
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
     health_response_body: ClassVar[bytes | None] = None
@@ -40,6 +43,14 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     task_instance_max_page_limit: ClassVar[int | None] = None
     task_instance_omit_total: ClassVar[bool] = False
     task_instance_ignores_offset: ClassVar[bool] = False
+    dag_run_redirect_status: ClassVar[int | None] = None
+    dag_run_redirect_location: ClassVar[str | None] = None
+    dag_run_failure_status: ClassVar[int | None] = None
+    patch_redirect_status: ClassVar[int | None] = None
+    patch_redirect_location: ClassVar[str | None] = None
+    health_redirect_location: ClassVar[str | None] = None
+    health_redirect_served: ClassVar[bool] = False
+    missing_dag_response_body: ClassVar[bytes | None] = None
 
     def _read_json(self) -> dict[str, Any] | None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -57,9 +68,18 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, status: int, location: str, body: bytes = b"") -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _record(self, payload: dict[str, Any] | None) -> str | None:
         authorization = self.headers.get("Authorization")
         type(self).requests_seen.append((self.command, self.path, payload, authorization))
+        type(self).request_headers_seen.append(dict(self.headers.items()))
         return authorization
 
     def do_POST(self) -> None:
@@ -77,6 +97,21 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/v2/dags/") and self.path.endswith("/dagRuns"):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
+                return
+            redirect_status = type(self).dag_run_redirect_status
+            if redirect_status is not None:
+                self._redirect(
+                    redirect_status,
+                    type(self).dag_run_redirect_location or "/redirected",
+                    b'{"detail":"reverse proxy redirect"}',
+                )
+                return
+            failure_status = type(self).dag_run_failure_status
+            if failure_status is not None:
+                self._respond(
+                    failure_status,
+                    {"detail": "scheduler accepted nothing"},
+                )
                 return
             body = type(self).dag_run_response_body
             if body is not None:
@@ -129,6 +164,16 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         authorization = self._record(None)
         request_path, _, request_query = self.path.partition("?")
+        if request_path == "/api/v2/monitor/health-redirected":
+            self._respond(
+                200,
+                {
+                    "metadatabase": {"status": "healthy"},
+                    "scheduler": {"status": "healthy"},
+                    "dag_processor": {"status": "healthy"},
+                },
+            )
+            return
         if request_path.endswith("/taskInstances"):
             if not self._bearer_ok(authorization):
                 self._respond(401, {"detail": "expired"})
@@ -179,11 +224,20 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
                 return
             requested_dag_id = self.path.rsplit("/", 1)[-1]
             if requested_dag_id == "missing_dag":
+                missing_dag_response_body = type(self).missing_dag_response_body
+                if missing_dag_response_body is not None:
+                    self._respond_bytes(404, missing_dag_response_body)
+                    return
                 self._respond(404, {"detail": "DAG not found"})
                 return
             self._respond(200, {"dag_id": requested_dag_id})
             return
         if self.path == "/api/v2/monitor/health":
+            health_redirect_location = type(self).health_redirect_location
+            if health_redirect_location is not None and not type(self).health_redirect_served:
+                type(self).health_redirect_served = True
+                self._redirect(307, health_redirect_location)
+                return
             health_response_body = type(self).health_response_body
             if health_response_body is not None:
                 self._respond_bytes(200, health_response_body)
@@ -198,6 +252,26 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
                     "dag_processor": {"status": status},
                 },
             )
+            return
+        self._respond(404, {"detail": self.path})
+
+    def do_PATCH(self) -> None:
+        payload = self._read_json()
+        authorization = self._record(payload)
+        if self.path.startswith("/api/v2/dags/"):
+            if not self._bearer_ok(authorization):
+                self._respond(401, {"detail": "expired"})
+                return
+            patch_redirect_status = type(self).patch_redirect_status
+            if patch_redirect_status is not None:
+                self._redirect(
+                    patch_redirect_status,
+                    type(self).patch_redirect_location or "/redirected",
+                    b'{"detail":"trailing slash redirect"}',
+                )
+                return
+            requested_dag_id = self.path.rsplit("/", 1)[-1]
+            self._respond(200, {"dag_id": requested_dag_id, "is_paused": False})
             return
         self._respond(404, {"detail": self.path})
 
@@ -216,6 +290,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
 def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.issued_tokens = []
     _StubAirflowHandler.requests_seen = []
+    _StubAirflowHandler.request_headers_seen = []
     _StubAirflowHandler.healthy = True
     _StubAirflowHandler.expire_first_token = False
     _StubAirflowHandler.health_response_body = None
@@ -228,6 +303,14 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.task_instance_max_page_limit = None
     _StubAirflowHandler.task_instance_omit_total = False
     _StubAirflowHandler.task_instance_ignores_offset = False
+    _StubAirflowHandler.dag_run_redirect_status = None
+    _StubAirflowHandler.dag_run_redirect_location = None
+    _StubAirflowHandler.dag_run_failure_status = None
+    _StubAirflowHandler.patch_redirect_status = None
+    _StubAirflowHandler.patch_redirect_location = None
+    _StubAirflowHandler.health_redirect_location = None
+    _StubAirflowHandler.health_redirect_served = False
+    _StubAirflowHandler.missing_dag_response_body = None
 
 
 @pytest.fixture(scope="module")
@@ -267,6 +350,87 @@ def test_trigger_fetches_token_once_and_sends_bearer(stub_server: str) -> None:
     assert (method, path) == ("POST", "/api/v2/dags/pipeline_ingest/dagRuns")
     assert payload == {"logical_date": None, "conf": {"uris": ["a.mcap"]}}
     assert authorization == "Bearer token-0"
+
+
+def test_request_header_and_body_shape_is_preserved(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    client.trigger_dag_run("pipeline_ingest", conf={"uris": ["a.mcap"]})
+
+    trigger_index = next(
+        index
+        for index, entry in enumerate(_StubAirflowHandler.requests_seen)
+        if entry[1].endswith("/dagRuns")
+    )
+    _method, _path, payload, authorization = _StubAirflowHandler.requests_seen[trigger_index]
+    headers = _StubAirflowHandler.request_headers_seen[trigger_index]
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/json"
+    assert authorization == "Bearer token-0"
+    assert payload == {"logical_date": None, "conf": {"uris": ["a.mcap"]}}
+
+
+def test_dag_get_request(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    assert client.dag("pipeline_ingest") == {"dag_id": "pipeline_ingest"}
+
+    dag_requests = [
+        entry
+        for entry in _StubAirflowHandler.requests_seen
+        if entry[0] == "GET" and entry[1] == "/api/v2/dags/pipeline_ingest"
+    ]
+    assert len(dag_requests) == 1
+    assert dag_requests[0][3] == "Bearer token-0"
+
+
+def test_unpause_dag_patch_request(stub_server: str) -> None:
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    assert client.unpause_dag("pipeline_ingest") == {
+        "dag_id": "pipeline_ingest",
+        "is_paused": False,
+    }
+
+    patch_requests = [
+        entry
+        for entry in _StubAirflowHandler.requests_seen
+        if entry[0] == "PATCH" and entry[1] == "/api/v2/dags/pipeline_ingest"
+    ]
+    assert len(patch_requests) == 1
+    assert patch_requests[0][2] == {"is_paused": False}
+    assert patch_requests[0][3] == "Bearer token-0"
+
+
+def test_connection_error_maps_to_typed_client_error() -> None:
+    with socket.socket() as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        unused_port = port_probe.getsockname()[1]
+    client = AirflowClient(f"http://127.0.0.1:{unused_port}", "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.health()
+
+    assert error_info.value.status is None
+    assert error_info.value.body == ""
+    assert "unreachable" in str(error_info.value)
+
+
+def test_timeout_error_maps_to_typed_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = AirflowClient("http://airflow.example", auth=BearerToken("token"))
+
+    def timeout_request(*_args: object, **_kwargs: object) -> httpx2.Response:
+        raise httpx2.ReadTimeout("request timed out")
+
+    monkeypatch.setattr(client._client, "request", timeout_request)
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.dag("pipeline_ingest")
+
+    assert error_info.value.status is None
+    assert error_info.value.body == ""
+    assert "unreachable" in str(error_info.value)
+    assert "request timed out" in str(error_info.value)
 
 
 def test_expired_token_is_refreshed_once(stub_server: str) -> None:
@@ -410,6 +574,24 @@ def test_conflict_without_a_dag_run_id_still_raises(stub_server: str) -> None:
     assert error_info.value.status == 409
 
 
+def test_http_status_body_and_excerpt_are_preserved(stub_server: str) -> None:
+    _StubAirflowHandler.missing_dag_response_body = (
+        b'{"detail":"DAG not found ' + b"x" * 250 + b' end-of-response"}'
+    )
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.dag("missing_dag")
+
+    message = str(error_info.value)
+    assert error_info.value.status == 404
+    assert error_info.value.body.endswith(' end-of-response"}')
+    assert message.startswith(f"GET {stub_server}/api/v2/dags/missing_dag failed with HTTP 404")
+    assert "DAG not found" in message
+    assert "end-of-response" not in message
+    assert "\n" not in message
+
+
 def test_ingest_refuses_a_batch_count_the_run_could_not_honour(stub_server: str) -> None:
     """The conf's owner refuses it here, before a run exists to fail.
 
@@ -533,6 +715,130 @@ def test_health_parses_body_not_status(stub_server: str) -> None:
     unhealthy = client.health()  # still HTTP 200: the body is the signal
     assert not unhealthy.healthy
     assert "scheduler=unhealthy" in unhealthy.summary()
+
+
+def test_get_redirect_is_followed(stub_server: str) -> None:
+    _StubAirflowHandler.health_redirect_location = "/api/v2/monitor/health-redirected"
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    assert client.health().healthy
+
+    health_paths = [
+        path
+        for method, path, _payload, _authorization in _StubAirflowHandler.requests_seen
+        if method == "GET" and path.startswith("/api/v2/monitor/health")
+    ]
+    assert health_paths == [
+        "/api/v2/monitor/health",
+        "/api/v2/monitor/health-redirected",
+    ]
+
+
+def test_post_redirect_is_refused_without_rewrite_to_get(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_redirect_status = 307
+    _StubAirflowHandler.dag_run_redirect_location = "/api/v2/redirected"
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.trigger_dag_run("pipeline_ingest")
+
+    assert error_info.value.status == 307
+    trigger_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
+    ]
+    redirected_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1] == "/api/v2/redirected"
+    ]
+    assert len(trigger_requests) == 1
+    assert redirected_requests == []
+
+
+def test_post_redirect_error_includes_location_header(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_redirect_status = 301
+    _StubAirflowHandler.dag_run_redirect_location = "https://airflow.example/api/v2/dags/x/dagRuns"
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.trigger_dag_run("pipeline_ingest")
+
+    message = str(error_info.value)
+    assert error_info.value.status == 301
+    assert error_info.value.body == '{"detail":"reverse proxy redirect"}'
+    assert "failed with HTTP 301: redirect location: https://airflow.example" in message
+    assert "reverse proxy redirect" in message
+
+
+def test_patch_redirect_is_refused(stub_server: str) -> None:
+    _StubAirflowHandler.patch_redirect_status = 308
+    _StubAirflowHandler.patch_redirect_location = (
+        "https://airflow.example/api/v2/dags/pipeline_ingest"
+    )
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.unpause_dag("pipeline_ingest")
+
+    message = str(error_info.value)
+    assert error_info.value.status == 308
+    assert error_info.value.body == '{"detail":"trailing slash redirect"}'
+    assert "redirect location: https://airflow.example/api/v2/dags/pipeline_ingest" in message
+
+
+def test_post_is_sent_once_on_server_failure(stub_server: str) -> None:
+    _StubAirflowHandler.dag_run_failure_status = 503
+    client = AirflowClient(stub_server, "airflow", "right-password")
+
+    with pytest.raises(AirflowClientError) as error_info:
+        client.trigger_dag_run("pipeline_ingest")
+
+    assert error_info.value.status == 503
+    trigger_requests = [
+        entry for entry in _StubAirflowHandler.requests_seen if entry[1].endswith("/dagRuns")
+    ]
+    assert len(trigger_requests) == 1
+
+
+def test_request_timeout_reaches_httpx_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed_timeouts: list[float] = []
+
+    def fake_request(
+        _self: httpx2.Client,
+        method: str,
+        url: str,
+        **kwargs: object,
+    ) -> httpx2.Response:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, float)
+        observed_timeouts.append(timeout)
+        request = httpx2.Request(method, url)
+        return httpx2.Response(200, content=b'{"dag_id":"pipeline_ingest"}', request=request)
+
+    monkeypatch.setattr(client_module.httpx2.Client, "request", fake_request)
+    client = AirflowClient(
+        "http://airflow.example", auth=BearerToken("token"), request_timeout_s=12.5
+    )
+
+    assert client.dag("pipeline_ingest") == {"dag_id": "pipeline_ingest"}
+    assert observed_timeouts == [12.5]
+
+
+def test_client_close_and_context_manager_close_underlying_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_calls = 0
+
+    def close(self: httpx2.Client) -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    monkeypatch.setattr(client_module.httpx2.Client, "close", close)
+    client = AirflowClient("http://airflow.example", auth=BearerToken("token"))
+
+    client.close()
+    with AirflowClient("http://airflow.example", auth=BearerToken("token")) as context_client:
+        assert isinstance(context_client, AirflowClient)
+
+    assert close_calls == 2
 
 
 def test_malformed_success_response_raises_typed_client_error(stub_server: str) -> None:
