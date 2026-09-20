@@ -382,12 +382,12 @@ def _extract_frames(
         arguments.extend(("-skip_frame", "nokey"))
     # Preserve the original playback PTS through a seek. Adding a seek offset
     # back to rebased PTS would introduce rounding at non-tick-aligned starts.
-    # Selection excludes preceding-GOP frames and the exclusive end directly.
+    # Accurate seeking discards preceding-GOP frames before the input duration
+    # limit is applied. Disabling it can exhaust a short window before its start.
     arguments.extend(
         (
             "-copyts",
             "-start_at_zero",
-            "-noaccurate_seek",
             "-ss",
             f"{start_seconds:.3f}",
             "-t",

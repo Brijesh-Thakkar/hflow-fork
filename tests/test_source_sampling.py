@@ -408,7 +408,8 @@ def test_sampling_settings_refuse_invalid_limits(field_name: str, value: object)
         replace(SourceFrameSampling(), **{field_name: value})
 
 
-def test_long_source_sampling_retains_the_frame_cap(tmp_path: Path) -> None:
+@pytest.mark.parametrize("window", [SourceWindow(0, 130_000), SourceWindow(4000, 7000)])
+def test_long_source_sampling_retains_the_frame_cap(tmp_path: Path, window: SourceWindow) -> None:
     source_path = tmp_path / "long.mp4"
     subprocess.run(
         [
@@ -438,15 +439,18 @@ def test_long_source_sampling_retains_the_frame_cap(tmp_path: Path) -> None:
     samples = sample_source_frames(
         source_path,
         tmp_path / "samples",
-        window=SourceWindow(0, 130_000),
+        window=window,
         settings=SourceFrameSampling(
             mode=SourceSamplingMode.KEYFRAMES_FIRST,
             maximum_window_millis=130_000,
         ),
     )
-    assert len(samples.frames) == 16
-    assert samples.frames[0].timestamp_seconds == 0
-    assert 121 <= samples.frames[-1].timestamp_seconds < 130
+    if window.start_millis == 0:
+        assert len(samples.frames) == 16
+        assert samples.frames[0].timestamp_seconds == 0
+        assert 121 <= samples.frames[-1].timestamp_seconds < 130
+    else:
+        assert [frame.timestamp_seconds for frame in samples.frames] == [4, 5, 6]
     assert samples.actual_mode is SourceSamplingMode.UNIFORM
     assert samples.fallback_reason is KeyframeFallbackReason.TOO_FEW_KEYFRAMES
 
