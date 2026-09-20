@@ -245,8 +245,9 @@ class AirflowClient:
             if method in {"POST", "PATCH"} and 300 <= response.status_code < 400:
                 location = response.headers.get("Location")
                 if location:
-                    body_excerpt = f"redirect location: {location}" + (
-                        f"; {body_excerpt}" if body_excerpt else ""
+                    body_excerpt = _body_excerpt(
+                        f"redirect location: {_body_excerpt(location)}"
+                        + (f"; {body_excerpt}" if body_excerpt else "")
                     )
             raise AirflowClientError(
                 f"{method} {url} failed with HTTP {response.status_code}"

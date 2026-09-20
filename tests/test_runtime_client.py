@@ -1,17 +1,17 @@
 """AirflowClient against a stub HTTP server (no Docker, no Airflow)."""
 
+import contextlib
 import json
 import socket
 import threading
+import time
 import urllib.parse
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 
-import httpx2
 import pytest
 
-import hflow.runtime._client as client_module
 from hflow.runtime import (
     AirflowClient,
     AirflowClientError,
@@ -34,6 +34,7 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
     healthy: ClassVar[bool] = True
     expire_first_token: ClassVar[bool] = False
     health_response_body: ClassVar[bytes | None] = None
+    health_delay_s: ClassVar[float] = 0.0
     dag_run_response_body: ClassVar[dict[str, Any] | bytes | None] = None
     task_instances_response_body: ClassVar[dict[str, Any] | bytes | None] = None
     mapped_instance_count: ClassVar[int] = 0
@@ -66,7 +67,8 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(body)
 
     def _redirect(self, status: int, location: str, body: bytes = b"") -> None:
         self.send_response(status)
@@ -233,6 +235,8 @@ class _StubAirflowHandler(BaseHTTPRequestHandler):
             self._respond(200, {"dag_id": requested_dag_id})
             return
         if self.path == "/api/v2/monitor/health":
+            if type(self).health_delay_s > 0:
+                time.sleep(type(self).health_delay_s)
             health_redirect_location = type(self).health_redirect_location
             if health_redirect_location is not None and not type(self).health_redirect_served:
                 type(self).health_redirect_served = True
@@ -294,6 +298,7 @@ def _reset_stub_airflow_state() -> None:
     _StubAirflowHandler.healthy = True
     _StubAirflowHandler.expire_first_token = False
     _StubAirflowHandler.health_response_body = None
+    _StubAirflowHandler.health_delay_s = 0.0
     _StubAirflowHandler.dag_run_response_body = None
     _StubAirflowHandler.task_instances_response_body = None
     _StubAirflowHandler.mapped_instance_count = 0
@@ -416,21 +421,23 @@ def test_connection_error_maps_to_typed_client_error() -> None:
     assert "unreachable" in str(error_info.value)
 
 
-def test_timeout_error_maps_to_typed_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = AirflowClient("http://airflow.example", auth=BearerToken("token"))
-
-    def timeout_request(*_args: object, **_kwargs: object) -> httpx2.Response:
-        raise httpx2.ReadTimeout("request timed out")
-
-    monkeypatch.setattr(client._client, "request", timeout_request)
-
-    with pytest.raises(AirflowClientError) as error_info:
-        client.dag("pipeline_ingest")
+def test_request_timeout_expiry_maps_to_typed_client_error(stub_server: str) -> None:
+    _StubAirflowHandler.health_delay_s = 0.2
+    try:
+        with (
+            AirflowClient(
+                stub_server, "airflow", "right-password", request_timeout_s=0.01
+            ) as client,
+            pytest.raises(AirflowClientError) as error_info,
+        ):
+            client.health()
+    finally:
+        _StubAirflowHandler.health_delay_s = 0.0
 
     assert error_info.value.status is None
     assert error_info.value.body == ""
     assert "unreachable" in str(error_info.value)
-    assert "request timed out" in str(error_info.value)
+    assert "timed out" in str(error_info.value)
 
 
 def test_expired_token_is_refreshed_once(stub_server: str) -> None:
@@ -768,6 +775,24 @@ def test_post_redirect_error_includes_location_header(stub_server: str) -> None:
     assert "reverse proxy redirect" in message
 
 
+def test_post_redirect_location_diagnostic_is_bounded(stub_server: str) -> None:
+    long_location = "https://airflow.example/" + ("redirect/" * 100)
+    _StubAirflowHandler.dag_run_redirect_status = 301
+    _StubAirflowHandler.dag_run_redirect_location = long_location
+    with (
+        AirflowClient(stub_server, "airflow", "right-password") as client,
+        pytest.raises(AirflowClientError) as error_info,
+    ):
+        client.trigger_dag_run("pipeline_ingest")
+
+    message = str(error_info.value)
+    excerpt = message.split("failed with HTTP 301: ", 1)[1]
+    assert error_info.value.status == 301
+    assert error_info.value.body == '{"detail":"reverse proxy redirect"}'
+    assert excerpt.startswith("redirect location: https://airflow.example/redirect/")
+    assert len(excerpt) == 200
+
+
 def test_patch_redirect_is_refused(stub_server: str) -> None:
     _StubAirflowHandler.patch_redirect_status = 308
     _StubAirflowHandler.patch_redirect_location = (
@@ -798,47 +823,21 @@ def test_post_is_sent_once_on_server_failure(stub_server: str) -> None:
     assert len(trigger_requests) == 1
 
 
-def test_request_timeout_reaches_httpx_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    observed_timeouts: list[float] = []
-
-    def fake_request(
-        _self: httpx2.Client,
-        method: str,
-        url: str,
-        **kwargs: object,
-    ) -> httpx2.Response:
-        timeout = kwargs["timeout"]
-        assert isinstance(timeout, float)
-        observed_timeouts.append(timeout)
-        request = httpx2.Request(method, url)
-        return httpx2.Response(200, content=b'{"dag_id":"pipeline_ingest"}', request=request)
-
-    monkeypatch.setattr(client_module.httpx2.Client, "request", fake_request)
-    client = AirflowClient(
-        "http://airflow.example", auth=BearerToken("token"), request_timeout_s=12.5
-    )
-
-    assert client.dag("pipeline_ingest") == {"dag_id": "pipeline_ingest"}
-    assert observed_timeouts == [12.5]
-
-
-def test_client_close_and_context_manager_close_underlying_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    close_calls = 0
-
-    def close(self: httpx2.Client) -> None:
-        nonlocal close_calls
-        close_calls += 1
-
-    monkeypatch.setattr(client_module.httpx2.Client, "close", close)
+def test_client_close_makes_client_unusable() -> None:
     client = AirflowClient("http://airflow.example", auth=BearerToken("token"))
 
     client.close()
+
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        client.dag("pipeline_ingest")
+
+
+def test_context_manager_exit_makes_client_unusable() -> None:
     with AirflowClient("http://airflow.example", auth=BearerToken("token")) as context_client:
         assert isinstance(context_client, AirflowClient)
 
-    assert close_calls == 2
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        context_client.dag("pipeline_ingest")
 
 
 def test_malformed_success_response_raises_typed_client_error(stub_server: str) -> None:
